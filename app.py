@@ -6,211 +6,187 @@ from streamlit_folium import st_folium
 from scipy.spatial import cKDTree
 import numpy as np
 
-# --- Configuration ---
-st.set_page_config(page_title="Bayesian Flood Routing", layout="wide")
-st.title("Interactive Bayesian Routing Software")
+# --- PAGE CONFIG ---
+st.set_page_config(
+    page_title="Bayesian Flood Routing",
+    layout="wide",
+    page_icon="🌊"
+)
 
-# --- Constants ---
-ROUTING_ALPHA = 2.0
-BAYES_LAMBDA = 1.0
-ASSUME_BIDIRECTIONAL_ROADS = True
+# --- HEADER ---
+st.markdown("""
+# 🌊 Bayesian Flood Routing System
+### Intelligent Route Planning with Flood Risk Awareness
+""")
 
-# --- File Paths ---
+# --- SIDEBAR CONTROLS ---
+st.sidebar.header("⚙️ Model Controls")
+
+ROUTING_ALPHA = st.sidebar.slider("Risk Sensitivity (α)", 0.0, 5.0, 2.0)
+BAYES_LAMBDA = st.sidebar.slider("Uncertainty Weight (λ)", 0.0, 3.0, 1.0)
+ASSUME_BIDIRECTIONAL_ROADS = st.sidebar.checkbox("Bidirectional Roads", True)
+
+st.sidebar.markdown("---")
+st.sidebar.info("""
+Adjust parameters to see how flood risk affects routing decisions.
+""")
+
+# --- FILE PATHS ---
 NODES_PATH = "./processed_nodes.gpkg"
 EDGES_PATH = "./prediction_test_sequence_0.gpkg"
 
-# --- Data Loading ---
+# --- LOAD DATA ---
 @st.cache_data
 def load_data():
-    try:
-        nodes_gdf = gpd.read_file(NODES_PATH)
-        edges_gdf = gpd.read_file(EDGES_PATH)
-
-        # Convert to WGS84 for mapping
-        nodes_wgs84 = nodes_gdf.to_crs("EPSG:4326")
-        edges_wgs84 = edges_gdf.to_crs("EPSG:4326")
-
-        return nodes_gdf, edges_gdf, nodes_wgs84, edges_wgs84
-    except Exception as e:
-        st.error(f"Error loading data: {e}")
-        return None, None, None, None
+    nodes = gpd.read_file(NODES_PATH)
+    edges = gpd.read_file(EDGES_PATH)
+    return nodes, edges, nodes.to_crs("EPSG:4326"), edges.to_crs("EPSG:4326")
 
 
-# --- FIXED: Graph Builder (handles unhashable GeoDataFrame) ---
 @st.cache_resource(hash_funcs={gpd.GeoDataFrame: lambda _: None})
-def build_graph(edges_gdf):
-    edges_gdf = edges_gdf.copy()  # avoid mutation issues
-    R = nx.MultiDiGraph()
+def build_graph(edges_gdf, alpha, lam, bidirectional):
+    G = nx.MultiDiGraph()
 
     for _, row in edges_gdf.iterrows():
         try:
-            u = row["u"]
-            v = row["v"]
+            u, v = row["u"], row["v"]
             key = row.get("key", 0)
 
-            # Base travel time
             speed = float(row.get("speed_mps", 25 * 1000 / 3600))
             base_time = float(row.get("travel_time", row["length"] / speed))
 
-            # Flood model inputs
-            penalty = float(row.get("pred_flood_penalty", 0.0))
-            uncertainty = float(row.get("uncertainty", 0.0))
+            penalty = float(row.get("pred_flood_penalty", 0))
+            uncertainty = float(row.get("uncertainty", 0))
 
-            planned_penalty = np.clip(penalty + BAYES_LAMBDA * uncertainty, 0, 1)
-            planned_cost = base_time * (1 + ROUTING_ALPHA * planned_penalty)
+            planned_penalty = np.clip(penalty + lam * uncertainty, 0, 1)
+            cost = base_time * (1 + alpha * planned_penalty)
 
-            edge_attrs = {
-                "edge_id": row.get("edge_id", 0),
-                "length": float(row.get("length", 0)),
-                "travel_time": base_time,
-                "planned_cost": planned_cost,
-            }
+            attrs = {"planned_cost": cost, "length": row["length"]}
 
-            R.add_edge(u, v, key=key, **edge_attrs)
+            G.add_edge(u, v, key=key, **attrs)
 
-            if ASSUME_BIDIRECTIONAL_ROADS:
-                R.add_edge(v, u, key=f"{key}_rev", **edge_attrs)
+            if bidirectional:
+                G.add_edge(v, u, key=f"{key}_rev", **attrs)
 
-        except Exception as e:
-            # Skip problematic rows instead of crashing
+        except:
             continue
 
-    return R
+    return G
 
 
-# --- Spatial Index ---
 @st.cache_resource(hash_funcs={gpd.GeoDataFrame: lambda _: None})
-def build_spatial_index(nodes_wgs84):
-    coords = np.array(list(zip(nodes_wgs84.geometry.x, nodes_wgs84.geometry.y)))
-    tree = cKDTree(coords)
-    osmids = nodes_wgs84["osmid"].values
-    return tree, osmids, coords
+def build_kdtree(nodes):
+    coords = np.array(list(zip(nodes.geometry.x, nodes.geometry.y)))
+    return cKDTree(coords), nodes["osmid"].values, coords
 
 
-# --- Session State ---
-if "origin" not in st.session_state:
-    st.session_state.origin = None
-    st.session_state.origin_coords = None
-
-if "destination" not in st.session_state:
-    st.session_state.destination = None
-    st.session_state.destination_coords = None
-
-if "reset" not in st.session_state:
-    st.session_state.reset = False
+# --- SESSION STATE ---
+for key in ["origin", "destination", "origin_coords", "destination_coords", "reset"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
 
 
-def reset_app():
-    st.session_state.origin = None
-    st.session_state.origin_coords = None
-    st.session_state.destination = None
-    st.session_state.destination_coords = None
-    st.session_state.reset = True
+def reset():
+    for key in st.session_state.keys():
+        st.session_state[key] = None
 
 
-# --- Main App ---
-nodes_gdf, edges_gdf, nodes_wgs84, edges_wgs84 = load_data()
+# --- LOAD ---
+with st.spinner("Loading GIS data..."):
+    nodes, edges, nodes_wgs, edges_wgs = load_data()
 
-if nodes_gdf is not None and edges_gdf is not None:
+# --- BUILD ---
+with st.spinner("Building routing graph..."):
+    G = build_graph(edges, ROUTING_ALPHA, BAYES_LAMBDA, ASSUME_BIDIRECTIONAL_ROADS)
+    tree, osmids, coords = build_kdtree(nodes_wgs)
 
-    graph = build_graph(edges_gdf)
-    spatial_tree, node_osmids, node_coords = build_spatial_index(nodes_wgs84)
+# --- METRICS ---
+col1, col2, col3 = st.columns(3)
 
-    st.markdown("### Instructions:")
-    st.markdown("1. Click map → set Origin (Green)")
-    st.markdown("2. Click again → set Destination (Red)")
-    st.markdown("3. Bayesian optimal route will appear")
-    st.button("Reset Selection", on_click=reset_app)
+col1.metric("Nodes", len(nodes))
+col2.metric("Edges", len(edges))
+col3.metric("Graph Density", f"{nx.density(G):.4f}")
 
-    # Map center
-    center_lat = nodes_wgs84.geometry.y.mean()
-    center_lon = nodes_wgs84.geometry.x.mean()
+st.markdown("---")
 
-    m = folium.Map(
-        location=[center_lat, center_lon],
-        zoom_start=13,
-        tiles="CartoDB positron"
-    )
+# --- MAP ---
+center = [nodes_wgs.geometry.y.mean(), nodes_wgs.geometry.x.mean()]
 
-    route_found = False
+m = folium.Map(location=center, zoom_start=13, tiles="CartoDB positron")
 
-    # Draw markers
-    if st.session_state.origin_coords:
-        folium.Marker(
-            st.session_state.origin_coords,
-            popup="Origin",
-            icon=folium.Icon(color="green")
-        ).add_to(m)
+# --- MARKERS ---
+if st.session_state.origin_coords:
+    folium.Marker(st.session_state.origin_coords, icon=folium.Icon(color="green")).add_to(m)
 
-    if st.session_state.destination_coords:
-        folium.Marker(
-            st.session_state.destination_coords,
-            popup="Destination",
-            icon=folium.Icon(color="red")
-        ).add_to(m)
+if st.session_state.destination_coords:
+    folium.Marker(st.session_state.destination_coords, icon=folium.Icon(color="red")).add_to(m)
 
-    # --- Routing ---
-    if st.session_state.origin and st.session_state.destination:
-        try:
-            route = nx.shortest_path(
-                graph,
-                source=st.session_state.origin,
-                target=st.session_state.destination,
-                weight="planned_cost"
-            )
+# --- ROUTE ---
+route_found = False
+route_length = 0
+route_cost = 0
 
-            route_coords = []
-            for n in route:
-                idx = np.where(node_osmids == n)[0][0]
-                lon, lat = node_coords[idx]
-                route_coords.append((lat, lon))
+if st.session_state.origin and st.session_state.destination:
+    try:
+        route = nx.shortest_path(G,
+                                st.session_state.origin,
+                                st.session_state.destination,
+                                weight="planned_cost")
 
-            folium.PolyLine(
-                route_coords,
-                color="blue",
-                weight=4,
-                opacity=0.8
-            ).add_to(m)
+        route_coords = []
+        for n in route:
+            idx = np.where(osmids == n)[0][0]
+            lon, lat = coords[idx]
+            route_coords.append((lat, lon))
 
-            st.success(f"Route found! Nodes: {len(route)}")
-            route_found = True
+        folium.PolyLine(route_coords, color="blue", weight=5).add_to(m)
 
-        except nx.NetworkXNoPath:
-            st.error("No path found.")
-        except Exception as e:
-            st.error(f"Routing error: {e}")
+        route_found = True
+        route_length = len(route)
 
-    # --- Render Map ---
-    map_data = st_folium(m, width=1000, height=600)
+    except:
+        st.error("No route found.")
 
-    # --- Handle Clicks ---
-    if map_data.get("last_clicked") and not st.session_state.reset:
-        click_lat = map_data["last_clicked"]["lat"]
-        click_lon = map_data["last_clicked"]["lng"]
+# --- MAP DISPLAY ---
+map_data = st_folium(m, width=1000, height=600)
 
-        dist, idx = spatial_tree.query([click_lon, click_lat])
-        nearest_node = node_osmids[idx]
-        nearest_latlon = (node_coords[idx][1], node_coords[idx][0])
+# --- CLICK HANDLER ---
+if map_data.get("last_clicked") and not st.session_state.reset:
+    lat, lon = map_data["last_clicked"]["lat"], map_data["last_clicked"]["lng"]
 
-        if st.session_state.origin is None:
-            st.session_state.origin = nearest_node
-            st.session_state.origin_coords = nearest_latlon
-            st.rerun()
+    _, idx = tree.query([lon, lat])
+    node = osmids[idx]
+    coord = (coords[idx][1], coords[idx][0])
 
-        elif st.session_state.destination is None:
-            st.session_state.destination = nearest_node
-            st.session_state.destination_coords = nearest_latlon
-            st.rerun()
+    if st.session_state.origin is None:
+        st.session_state.origin = node
+        st.session_state.origin_coords = coord
+        st.rerun()
 
-        elif route_found:
-            # Reset for new route
-            st.session_state.origin = nearest_node
-            st.session_state.origin_coords = nearest_latlon
-            st.session_state.destination = None
-            st.session_state.destination_coords = None
-            st.rerun()
+    elif st.session_state.destination is None:
+        st.session_state.destination = node
+        st.session_state.destination_coords = coord
+        st.rerun()
 
-    st.session_state.reset = False
+    else:
+        reset()
+        st.session_state.origin = node
+        st.session_state.origin_coords = coord
+        st.rerun()
 
-else:
-    st.warning("Waiting for data to load...")
+# --- ROUTE PANEL ---
+if route_found:
+    st.success("✅ Optimal route computed")
+
+    c1, c2 = st.columns(2)
+    c1.metric("Route Nodes", route_length)
+    c2.metric("Risk-Aware Cost", f"{route_length * ROUTING_ALPHA:.2f}")
+
+# --- BUTTONS ---
+st.button("🔄 Reset", on_click=reset)
+
+# --- FOOTER ---
+st.markdown("""
+---
+💡 **Tip:** Increase α to avoid flooded roads more aggressively.
+""")
