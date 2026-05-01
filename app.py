@@ -12,8 +12,7 @@ import numpy as np
 # =========================
 st.set_page_config(page_title="Flood Route Planner", layout="wide")
 
-st.title("🌊 Flood-Route Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm")
-st.caption("Flood-aware routing with hazard visualization, travel time, and uncertainty")
+st.title("Flood-Route Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm")
 
 # =========================
 # SIDEBAR
@@ -33,7 +32,11 @@ def load_data():
     edges = gpd.read_file("./prediction_test_sequence_0.gpkg")
     return nodes, edges, nodes.to_crs("EPSG:4326"), edges.to_crs("EPSG:4326")
 
-nodes, edges, nodes_wgs, edges_wgs = load_data()
+try:
+    nodes, edges, nodes_wgs, edges_wgs = load_data()
+except:
+    st.error("⚠️ Failed to load data. Check file paths.")
+    st.stop()
 
 # =========================
 # BUILD GRAPH
@@ -41,7 +44,6 @@ nodes, edges, nodes_wgs, edges_wgs = load_data()
 @st.cache_resource(hash_funcs={gpd.GeoDataFrame: lambda _: None})
 def build_graph(edges, alpha, lam):
     G = nx.MultiDiGraph()
-
     for _, row in edges.iterrows():
         try:
             u, v = row["u"], row["v"]
@@ -94,138 +96,124 @@ if "origin" not in st.session_state:
     st.session_state.route_risk = None
 
 def reset():
-    st.session_state.origin = None
-    st.session_state.destination = None
-    st.session_state.origin_coords = None
-    st.session_state.destination_coords = None
-    st.session_state.route_time = None
-    st.session_state.route_risk = None
+    for k in ["origin", "destination", "origin_coords", "destination_coords", "route_time", "route_risk"]:
+        st.session_state[k] = None
 
 # =========================
-# LAYOUT
+# UI CONTROLS (TOP)
 # =========================
-left, right = st.columns([3, 1])
+col1, col2, col3 = st.columns(3)
 
-# =========================
-# RIGHT PANEL
-# =========================
-with right:
-    st.subheader("Selection")
+with col1:
+    st.radio("Select Marker", ["origin", "destination"], key="active")
 
-    st.radio(
-        "Active Marker",
-        ["origin", "destination"],
-        key="active",
-        format_func=lambda x: "Origin" if x == "origin" else "Destination"
-    )
-
-    st.markdown("---")
-
-    st.subheader("Route Info")
-
-    if st.session_state.route_time:
-        st.metric("Travel Time (min)", f"{st.session_state.route_time / 60:.2f}")
-        st.metric("Avg Flood Risk", f"{st.session_state.route_risk:.2f}")
-    else:
-        st.info("Select origin and destination")
-
+with col2:
     st.button("Reset Route", on_click=reset)
 
+with col3:
+    if st.session_state.route_time:
+        st.success(f"⏱ {st.session_state.route_time/60:.2f} min | Risk: {st.session_state.route_risk:.2f}")
+
 # =========================
-# MAP
+# MAP (MAIN FOCUS)
 # =========================
-with left:
-    center = [nodes_wgs.geometry.y.mean(), nodes_wgs.geometry.x.mean()]
-    m = folium.Map(location=center, zoom_start=13, control_scale=True)
+center = [nodes_wgs.geometry.y.mean(), nodes_wgs.geometry.x.mean()]
 
-    folium.TileLayer("CartoDB positron").add_to(m)
-    folium.TileLayer("OpenStreetMap").add_to(m)
-    folium.LayerControl().add_to(m)
-    MiniMap().add_to(m)
+m = folium.Map(location=center, zoom_start=13, control_scale=True)
 
-    # =========================
-    # FLOOD LAYER
-    # =========================
-    if SHOW_FLOOD:
-        for _, row in edges_wgs.iterrows():
-            try:
-                geom = row.geometry
-                risk = float(row.get("pred_flood_penalty", 0))
+folium.TileLayer("CartoDB positron").add_to(m)
+folium.TileLayer("OpenStreetMap").add_to(m)
+folium.LayerControl().add_to(m)
+MiniMap().add_to(m)
 
-                if risk < 0.3:
-                    color = "blue"
-                elif risk < 0.6:
-                    color = "orange"
-                else:
-                    color = "red"
-
-                folium.GeoJson(
-                    geom,
-                    style_function=lambda x, col=color: {
-                        "color": col,
-                        "weight": 2,
-                        "opacity": 0.5
-                    }
-                ).add_to(m)
-            except:
-                continue
-
-    # =========================
-    # MARKERS
-    # =========================
-    if st.session_state.origin_coords:
-        folium.CircleMarker(st.session_state.origin_coords, radius=8, color="green", fill=True).add_to(m)
-
-    if st.session_state.destination_coords:
-        folium.CircleMarker(st.session_state.destination_coords, radius=8, color="red", fill=True).add_to(m)
-
-    # =========================
-    # ROUTE
-    # =========================
-    if st.session_state.origin and st.session_state.destination:
+# =========================
+# FLOOD LAYER
+# =========================
+if SHOW_FLOOD:
+    for _, row in edges_wgs.iterrows():
         try:
-            route = nx.shortest_path(
-                G,
-                st.session_state.origin,
-                st.session_state.destination,
-                weight="planned_cost"
-            )
+            risk = float(row.get("pred_flood_penalty", 0))
 
-            route_coords = []
-            total_time = 0
-            total_risk = 0
+            if risk < 0.3:
+                color = "blue"
+            elif risk < 0.6:
+                color = "orange"
+            else:
+                color = "red"
 
-            for i in range(len(route) - 1):
-                u, v = route[i], route[i + 1]
-
-                edge_data = list(G.get_edge_data(u, v).values())[0]
-
-                total_time += edge_data["travel_time"]
-                total_risk += edge_data["risk"]
-
-                idx = np.where(osmids == u)[0][0]
-                lon, lat = coords[idx]
-                route_coords.append((lat, lon))
-
-            # last node
-            idx = np.where(osmids == route[-1])[0][0]
-            lon, lat = coords[idx]
-            route_coords.append((lat, lon))
-
-            st.session_state.route_time = total_time
-            st.session_state.route_risk = total_risk / (len(route) - 1)
-
-            folium.PolyLine(route_coords, color="#2563eb", weight=5).add_to(m)
+            folium.GeoJson(
+                row.geometry,
+                style_function=lambda x, col=color: {
+                    "color": col,
+                    "weight": 2,
+                    "opacity": 0.5
+                }
+            ).add_to(m)
 
         except:
-            st.warning("No route found")
+            continue
 
-    map_data = st_folium(m, width=900, height=600)
+# =========================
+# MARKERS
+# =========================
+if st.session_state.origin_coords:
+    folium.CircleMarker(st.session_state.origin_coords, radius=8, color="green", fill=True).add_to(m)
+
+if st.session_state.destination_coords:
+    folium.CircleMarker(st.session_state.destination_coords, radius=8, color="red", fill=True).add_to(m)
+
+# =========================
+# ROUTE
+# =========================
+if st.session_state.origin and st.session_state.destination:
+    try:
+        route = nx.shortest_path(
+            G,
+            st.session_state.origin,
+            st.session_state.destination,
+            weight="planned_cost"
+        )
+
+        coords_route = []
+        total_time = 0
+        total_risk = 0
+
+        for i in range(len(route) - 1):
+            u, v = route[i], route[i + 1]
+            edge_data = list(G.get_edge_data(u, v).values())[0]
+
+            total_time += edge_data["travel_time"]
+            total_risk += edge_data["risk"]
+
+            idx = np.where(osmids == u)[0][0]
+            lon, lat = coords[idx]
+            coords_route.append((lat, lon))
+
+        idx = np.where(osmids == route[-1])[0][0]
+        lon, lat = coords[idx]
+        coords_route.append((lat, lon))
+
+        st.session_state.route_time = total_time
+        st.session_state.route_risk = total_risk / (len(route) - 1)
+
+        folium.PolyLine(coords_route, color="#2563eb", weight=6).add_to(m)
+
+    except:
+        st.warning("No route found")
+
+# =========================
+# DISPLAY MAP (FIXED)
+# =========================
+map_data = st_folium(
+    m,
+    use_container_width=True,
+    height=650
+)
 
 # =========================
 # CLICK HANDLER
 # =========================
-if map_data.get("last_clicked"):
+if map_data and map_data.get("last_clicked"):
     lat = map_data["last_clicked"]["lat"]
     lon = map_data["last_clicked"]["lng"]
 
