@@ -12,11 +12,8 @@ import numpy as np
 # =========================
 st.set_page_config(page_title="Flood Route Planner", layout="wide")
 
-# =========================
-# TITLE
-# =========================
-st.title("Flood-Route Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm")
-st.caption("Flood-aware routing with uncertainty modeling and optimal path computation")
+st.title("🌊 Flood-Route Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm")
+st.caption("Flood-aware routing with hazard visualization, travel time, and uncertainty")
 
 # =========================
 # SIDEBAR
@@ -25,11 +22,10 @@ st.sidebar.header("Model Controls")
 
 ROUTING_ALPHA = st.sidebar.slider("Risk Sensitivity (α)", 0.0, 5.0, 2.0)
 BAYES_LAMBDA = st.sidebar.slider("Uncertainty Weight (λ)", 0.0, 3.0, 1.0)
-
-show_flood = st.sidebar.checkbox("Show Flood Hazard Layer", True)
+SHOW_FLOOD = st.sidebar.checkbox("Show Flood Hazard", True)
 
 # =========================
-# DATA
+# LOAD DATA
 # =========================
 @st.cache_data
 def load_data():
@@ -37,6 +33,11 @@ def load_data():
     edges = gpd.read_file("./prediction_test_sequence_0.gpkg")
     return nodes, edges, nodes.to_crs("EPSG:4326"), edges.to_crs("EPSG:4326")
 
+nodes, edges, nodes_wgs, edges_wgs = load_data()
+
+# =========================
+# BUILD GRAPH
+# =========================
 @st.cache_resource(hash_funcs={gpd.GeoDataFrame: lambda _: None})
 def build_graph(edges, alpha, lam):
     G = nx.MultiDiGraph()
@@ -54,27 +55,30 @@ def build_graph(edges, alpha, lam):
             risk = np.clip(penalty + lam * uncertainty, 0, 1)
             cost = base_time * (1 + alpha * risk)
 
-            G.add_edge(u, v,
-                       planned_cost=cost,
-                       travel_time=base_time,
-                       risk=risk)
+            attrs = {
+                "planned_cost": cost,
+                "travel_time": base_time,
+                "risk": risk
+            }
 
-            G.add_edge(v, u,
-                       planned_cost=cost,
-                       travel_time=base_time,
-                       risk=risk)
+            G.add_edge(u, v, **attrs)
+            G.add_edge(v, u, **attrs)
+
         except:
             continue
 
     return G
 
+G = build_graph(edges, ROUTING_ALPHA, BAYES_LAMBDA)
+
+# =========================
+# KD TREE
+# =========================
 @st.cache_resource(hash_funcs={gpd.GeoDataFrame: lambda _: None})
 def build_tree(nodes):
     coords = np.array(list(zip(nodes.geometry.x, nodes.geometry.y)))
     return cKDTree(coords), nodes["osmid"].values, coords
 
-nodes, edges, nodes_wgs, edges_wgs = load_data()
-G = build_graph(edges, ROUTING_ALPHA, BAYES_LAMBDA)
 tree, osmids, coords = build_tree(nodes_wgs)
 
 # =========================
@@ -86,12 +90,16 @@ if "origin" not in st.session_state:
     st.session_state.origin_coords = None
     st.session_state.destination_coords = None
     st.session_state.active = "origin"
+    st.session_state.route_time = None
+    st.session_state.route_risk = None
 
 def reset():
     st.session_state.origin = None
     st.session_state.destination = None
     st.session_state.origin_coords = None
     st.session_state.destination_coords = None
+    st.session_state.route_time = None
+    st.session_state.route_risk = None
 
 # =========================
 # LAYOUT
@@ -102,26 +110,24 @@ left, right = st.columns([3, 1])
 # RIGHT PANEL
 # =========================
 with right:
-    st.markdown("### 📍 Selection")
+    st.subheader("Selection")
 
     st.radio(
         "Active Marker",
         ["origin", "destination"],
         key="active",
-        format_func=lambda x: "Origin (Green)" if x == "origin" else "Destination (Red)"
+        format_func=lambda x: "Origin" if x == "origin" else "Destination"
     )
 
-    st.markdown("### 📊 Route Info")
+    st.markdown("---")
 
-    route_time = 0
-    route_risk = 0
+    st.subheader("Route Info")
 
-    if "route_time" in st.session_state:
-        route_time = st.session_state.route_time
-        route_risk = st.session_state.route_risk
-
-        st.metric("Travel Time (min)", f"{route_time/60:.2f}")
-        st.metric("Avg Flood Risk", f"{route_risk:.2f}")
+    if st.session_state.route_time:
+        st.metric("Travel Time (min)", f"{st.session_state.route_time / 60:.2f}")
+        st.metric("Avg Flood Risk", f"{st.session_state.route_risk:.2f}")
+    else:
+        st.info("Select origin and destination")
 
     st.button("Reset Route", on_click=reset)
 
@@ -138,34 +144,35 @@ with left:
     MiniMap().add_to(m)
 
     # =========================
-    # FLOOD HAZARD LAYER
+    # FLOOD LAYER
     # =========================
-    if show_flood:
+    if SHOW_FLOOD:
         for _, row in edges_wgs.iterrows():
             try:
                 geom = row.geometry
                 risk = float(row.get("pred_flood_penalty", 0))
 
                 if risk < 0.3:
-                    color = "#3b82f6"  # blue
+                    color = "blue"
                 elif risk < 0.6:
-                    color = "#facc15"  # yellow
+                    color = "orange"
                 else:
-                    color = "#dc2626"  # red
+                    color = "red"
 
                 folium.GeoJson(
                     geom,
                     style_function=lambda x, col=color: {
                         "color": col,
                         "weight": 2,
-                        "opacity": 0.6
+                        "opacity": 0.5
                     }
                 ).add_to(m)
-
             except:
                 continue
 
-    # markers
+    # =========================
+    # MARKERS
+    # =========================
     if st.session_state.origin_coords:
         folium.CircleMarker(st.session_state.origin_coords, radius=8, color="green", fill=True).add_to(m)
 
@@ -173,7 +180,7 @@ with left:
         folium.CircleMarker(st.session_state.destination_coords, radius=8, color="red", fill=True).add_to(m)
 
     # =========================
-    # ROUTE COMPUTATION
+    # ROUTE
     # =========================
     if st.session_state.origin and st.session_state.destination:
         try:
@@ -184,32 +191,31 @@ with left:
                 weight="planned_cost"
             )
 
-            coords_route = []
+            route_coords = []
             total_time = 0
             total_risk = 0
 
-            for i in range(len(route)-1):
-                u, v = route[i], route[i+1]
-                edge_data = G.get_edge_data(u, v)[0]
+            for i in range(len(route) - 1):
+                u, v = route[i], route[i + 1]
+
+                edge_data = list(G.get_edge_data(u, v).values())[0]
 
                 total_time += edge_data["travel_time"]
                 total_risk += edge_data["risk"]
 
                 idx = np.where(osmids == u)[0][0]
                 lon, lat = coords[idx]
-                coords_route.append((lat, lon))
+                route_coords.append((lat, lon))
 
-            # add last node
+            # last node
             idx = np.where(osmids == route[-1])[0][0]
             lon, lat = coords[idx]
-            coords_route.append((lat, lon))
-
-            avg_risk = total_risk / (len(route)-1)
+            route_coords.append((lat, lon))
 
             st.session_state.route_time = total_time
-            st.session_state.route_risk = avg_risk
+            st.session_state.route_risk = total_risk / (len(route) - 1)
 
-            folium.PolyLine(coords_route, color="#2563eb", weight=5).add_to(m)
+            folium.PolyLine(route_coords, color="#2563eb", weight=5).add_to(m)
 
         except:
             st.warning("No route found")
