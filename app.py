@@ -10,73 +10,23 @@ import numpy as np
 # =========================
 # PAGE CONFIG
 # =========================
-st.set_page_config(page_title="Flood Routing", layout="wide")
+st.set_page_config(page_title="Flood Route Planner", layout="wide")
 
 # =========================
-# CLEAN UI STYLING
+# TITLE
 # =========================
-st.markdown("""
-<style>
-html, body, [class*="css"] {
-    font-family: 'Inter', 'Segoe UI', sans-serif;
-}
-
-/* Title */
-h1 {
-    color: #111827;
-    font-weight: 600;
-}
-
-/* Subtitle */
-.subtitle {
-    color: #6b7280;
-    font-size: 15px;
-}
-
-/* Card */
-.card {
-    background: #ffffff;
-    border: 1px solid #e5e7eb;
-    border-radius: 10px;
-    padding: 16px;
-    margin-bottom: 12px;
-}
-
-/* Buttons */
-.stButton button {
-    border-radius: 8px;
-    background-color: #2563eb;
-    color: white;
-    border: none;
-}
-
-/* Info box */
-.info-box {
-    background: #eff6ff;
-    padding: 10px;
-    border-radius: 8px;
-    color: #1e40af;
-    font-size: 14px;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# =========================
-# HEADER
-# =========================
-st.markdown("<h1> Flood-Route Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm </h1>", unsafe_allow_html=True)
-st.markdown("<p class='subtitle'>Smart routing using flood prediction and uncertainty modeling</p>", unsafe_allow_html=True)
+st.title("🌊 Flood-Route Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm")
+st.caption("Flood-aware routing with uncertainty modeling and optimal path computation")
 
 # =========================
 # SIDEBAR
 # =========================
-st.sidebar.header("⚙️ Model Settings")
+st.sidebar.header("Model Controls")
 
 ROUTING_ALPHA = st.sidebar.slider("Risk Sensitivity (α)", 0.0, 5.0, 2.0)
 BAYES_LAMBDA = st.sidebar.slider("Uncertainty Weight (λ)", 0.0, 3.0, 1.0)
 
-st.sidebar.markdown("---")
-st.sidebar.caption("Higher α avoids flooded roads more aggressively")
+show_flood = st.sidebar.checkbox("Show Flood Hazard Layer", True)
 
 # =========================
 # DATA
@@ -85,27 +35,37 @@ st.sidebar.caption("Higher α avoids flooded roads more aggressively")
 def load_data():
     nodes = gpd.read_file("./processed_nodes.gpkg")
     edges = gpd.read_file("./prediction_test_sequence_0.gpkg")
-    return nodes, edges, nodes.to_crs("EPSG:4326")
+    return nodes, edges, nodes.to_crs("EPSG:4326"), edges.to_crs("EPSG:4326")
 
 @st.cache_resource(hash_funcs={gpd.GeoDataFrame: lambda _: None})
 def build_graph(edges, alpha, lam):
     G = nx.MultiDiGraph()
+
     for _, row in edges.iterrows():
         try:
             u, v = row["u"], row["v"]
+
             speed = float(row.get("speed_mps", 25 * 1000 / 3600))
-            base = float(row.get("travel_time", row["length"] / speed))
+            base_time = float(row.get("travel_time", row["length"] / speed))
 
             penalty = float(row.get("pred_flood_penalty", 0))
             uncertainty = float(row.get("uncertainty", 0))
 
             risk = np.clip(penalty + lam * uncertainty, 0, 1)
-            cost = base * (1 + alpha * risk)
+            cost = base_time * (1 + alpha * risk)
 
-            G.add_edge(u, v, planned_cost=cost)
-            G.add_edge(v, u, planned_cost=cost)
+            G.add_edge(u, v,
+                       planned_cost=cost,
+                       travel_time=base_time,
+                       risk=risk)
+
+            G.add_edge(v, u,
+                       planned_cost=cost,
+                       travel_time=base_time,
+                       risk=risk)
         except:
             continue
+
     return G
 
 @st.cache_resource(hash_funcs={gpd.GeoDataFrame: lambda _: None})
@@ -113,7 +73,7 @@ def build_tree(nodes):
     coords = np.array(list(zip(nodes.geometry.x, nodes.geometry.y)))
     return cKDTree(coords), nodes["osmid"].values, coords
 
-nodes, edges, nodes_wgs = load_data()
+nodes, edges, nodes_wgs, edges_wgs = load_data()
 G = build_graph(edges, ROUTING_ALPHA, BAYES_LAMBDA)
 tree, osmids, coords = build_tree(nodes_wgs)
 
@@ -151,11 +111,17 @@ with right:
         format_func=lambda x: "Origin (Green)" if x == "origin" else "Destination (Red)"
     )
 
-    st.markdown("<div class='info-box'>Click anywhere on the map to place or move the selected marker.</div>", unsafe_allow_html=True)
+    st.markdown("### 📊 Route Info")
 
-    st.markdown("### Current Nodes")
-    st.write("Origin:", st.session_state.origin or "Not set")
-    st.write("Destination:", st.session_state.destination or "Not set")
+    route_time = 0
+    route_risk = 0
+
+    if "route_time" in st.session_state:
+        route_time = st.session_state.route_time
+        route_risk = st.session_state.route_risk
+
+        st.metric("Travel Time (min)", f"{route_time/60:.2f}")
+        st.metric("Avg Flood Risk", f"{route_risk:.2f}")
 
     st.button("Reset Route", on_click=reset)
 
@@ -164,39 +130,51 @@ with right:
 # =========================
 with left:
     center = [nodes_wgs.geometry.y.mean(), nodes_wgs.geometry.x.mean()]
-
     m = folium.Map(location=center, zoom_start=13, control_scale=True)
 
-    # basemaps
-    folium.TileLayer("CartoDB positron", name="Light").add_to(m)
-    folium.TileLayer("OpenStreetMap", name="Street").add_to(m)
-    folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
-
+    folium.TileLayer("CartoDB positron").add_to(m)
+    folium.TileLayer("OpenStreetMap").add_to(m)
     folium.LayerControl().add_to(m)
     MiniMap().add_to(m)
 
+    # =========================
+    # FLOOD HAZARD LAYER
+    # =========================
+    if show_flood:
+        for _, row in edges_wgs.iterrows():
+            try:
+                geom = row.geometry
+                risk = float(row.get("pred_flood_penalty", 0))
+
+                if risk < 0.3:
+                    color = "#3b82f6"  # blue
+                elif risk < 0.6:
+                    color = "#facc15"  # yellow
+                else:
+                    color = "#dc2626"  # red
+
+                folium.GeoJson(
+                    geom,
+                    style_function=lambda x, col=color: {
+                        "color": col,
+                        "weight": 2,
+                        "opacity": 0.6
+                    }
+                ).add_to(m)
+
+            except:
+                continue
+
     # markers
     if st.session_state.origin_coords:
-        folium.CircleMarker(
-            st.session_state.origin_coords,
-            radius=8,
-            color="#16a34a",
-            fill=True,
-            fill_color="#16a34a",
-            tooltip="Origin"
-        ).add_to(m)
+        folium.CircleMarker(st.session_state.origin_coords, radius=8, color="green", fill=True).add_to(m)
 
     if st.session_state.destination_coords:
-        folium.CircleMarker(
-            st.session_state.destination_coords,
-            radius=8,
-            color="#dc2626",
-            fill=True,
-            fill_color="#dc2626",
-            tooltip="Destination"
-        ).add_to(m)
+        folium.CircleMarker(st.session_state.destination_coords, radius=8, color="red", fill=True).add_to(m)
 
-    # route
+    # =========================
+    # ROUTE COMPUTATION
+    # =========================
     if st.session_state.origin and st.session_state.destination:
         try:
             route = nx.shortest_path(
@@ -207,17 +185,31 @@ with left:
             )
 
             coords_route = []
-            for n in route:
-                idx = np.where(osmids == n)[0][0]
+            total_time = 0
+            total_risk = 0
+
+            for i in range(len(route)-1):
+                u, v = route[i], route[i+1]
+                edge_data = G.get_edge_data(u, v)[0]
+
+                total_time += edge_data["travel_time"]
+                total_risk += edge_data["risk"]
+
+                idx = np.where(osmids == u)[0][0]
                 lon, lat = coords[idx]
                 coords_route.append((lat, lon))
 
-            folium.PolyLine(
-                coords_route,
-                color="#2563eb",
-                weight=5,
-                opacity=0.8
-            ).add_to(m)
+            # add last node
+            idx = np.where(osmids == route[-1])[0][0]
+            lon, lat = coords[idx]
+            coords_route.append((lat, lon))
+
+            avg_risk = total_risk / (len(route)-1)
+
+            st.session_state.route_time = total_time
+            st.session_state.route_risk = avg_risk
+
+            folium.PolyLine(coords_route, color="#2563eb", weight=5).add_to(m)
 
         except:
             st.warning("No route found")
