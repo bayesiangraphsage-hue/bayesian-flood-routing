@@ -64,7 +64,7 @@ h1 {
 # =========================
 # HEADER
 # =========================
-st.markdown("<h1>🌊 Flood-Aware Route Planner</h1>", unsafe_allow_html=True)
+st.markdown("<h1> Flood-ROute Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm </h1>", unsafe_allow_html=True)
 st.markdown("<p class='subtitle'>Smart routing using flood prediction and uncertainty modeling</p>", unsafe_allow_html=True)
 
 # =========================
