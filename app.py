@@ -11,15 +11,14 @@ import numpy as np
 # =========================
 st.set_page_config(page_title="Flood Route Planner", layout="wide")
 
-st.title("Flood-Route Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm")
+st.title("🌊 Flood-Route Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm")
 
 # =========================
 # SIDEBAR
 # =========================
-ROUTING_ALPHA = st.sidebar.slider("Risk Sensitivity (α)", 0.0, 5.0, 2.0)
-BAYES_LAMBDA = st.sidebar.slider("Uncertainty Weight (λ)", 0.0, 3.0, 1.0)
+alpha = st.sidebar.slider("Risk Sensitivity (α)", 0.0, 5.0, 2.0)
+lam = st.sidebar.slider("Uncertainty (λ)", 0.0, 3.0, 1.0)
 time_step = st.sidebar.slider("Flood Time", 0, 10, 0)
-SHOW_FLOOD = st.sidebar.checkbox("Show Flood Layer", True)
 
 # =========================
 # LOAD DATA
@@ -28,9 +27,9 @@ SHOW_FLOOD = st.sidebar.checkbox("Show Flood Layer", True)
 def load_data():
     nodes = gpd.read_file("./processed_nodes.gpkg")
     edges = gpd.read_file("./prediction_test_sequence_0.gpkg")
-    return nodes.to_crs("EPSG:4326"), edges.to_crs("EPSG:4326")
+    return nodes.to_crs("EPSG:4326"), edges
 
-nodes_wgs, edges_wgs = load_data()
+nodes, edges = load_data()
 
 # =========================
 # KD TREE
@@ -40,13 +39,13 @@ def build_tree(nodes):
     coords = np.array(list(zip(nodes.geometry.x, nodes.geometry.y)))
     return cKDTree(coords), nodes["osmid"].values, coords
 
-tree, osmids, coords = build_tree(nodes_wgs)
+tree, osmids, coords = build_tree(nodes)
 
 # =========================
-# GRAPH (CACHED PER TIME)
+# BUILD GRAPH ONCE
 # =========================
 @st.cache_resource
-def build_graph(edges, alpha, lam, t):
+def build_base_graph(edges):
     G = nx.MultiDiGraph()
 
     for row in edges.itertuples():
@@ -55,34 +54,27 @@ def build_graph(edges, alpha, lam, t):
 
             speed = getattr(row, "speed_mps", 25 * 1000 / 3600)
             length = getattr(row, "length", 0)
-
             base_time = getattr(row, "travel_time", length / speed)
 
-            base_penalty = getattr(row, "pred_flood_penalty", 0)
+            penalty = getattr(row, "pred_flood_penalty", 0)
             uncertainty = getattr(row, "uncertainty", 0)
 
-            # dynamic flood (simple scaling)
-            dynamic_penalty = base_penalty * (1 + 0.1 * t)
-
-            risk = np.clip(dynamic_penalty + lam * uncertainty, 0, 1)
-            cost = base_time * (1 + alpha * risk)
-
             G.add_edge(u, v,
-                       planned_cost=cost,
-                       travel_time=base_time,
-                       risk=risk)
+                       base_time=base_time,
+                       penalty=penalty,
+                       uncertainty=uncertainty)
 
             G.add_edge(v, u,
-                       planned_cost=cost,
-                       travel_time=base_time,
-                       risk=risk)
+                       base_time=base_time,
+                       penalty=penalty,
+                       uncertainty=uncertainty)
 
         except:
             continue
 
     return G
 
-G = build_graph(edges_wgs, ROUTING_ALPHA, BAYES_LAMBDA, time_step)
+G = build_base_graph(edges)
 
 # =========================
 # SESSION
@@ -100,46 +92,20 @@ if "origin" not in st.session_state:
 col1, col2 = st.columns([3, 1])
 
 with col2:
-    st.radio("Active Marker", ["origin", "destination"], key="active")
+    st.radio("Marker", ["origin", "destination"], key="active")
+
     if st.button("Reset"):
-        st.session_state.origin = None
-        st.session_state.destination = None
-        st.session_state.origin_coords = None
-        st.session_state.destination_coords = None
+        for k in st.session_state.keys():
+            st.session_state[k] = None
 
 # =========================
-# MAP
+# MAP (FAST)
 # =========================
 with col1:
-    center = [nodes_wgs.geometry.y.mean(), nodes_wgs.geometry.x.mean()]
+    center = [nodes.geometry.y.mean(), nodes.geometry.x.mean()]
     m = folium.Map(location=center, zoom_start=13)
 
-    # =========================
-    # FAST FLOOD LAYER (SAMPLED)
-    # =========================
-    if SHOW_FLOOD:
-        sample_edges = edges_wgs.sample(min(800, len(edges_wgs)))
-
-        for row in sample_edges.itertuples():
-            try:
-                risk = getattr(row, "pred_flood_penalty", 0) * (1 + 0.1 * time_step)
-
-                color = "blue" if risk < 0.3 else "orange" if risk < 0.6 else "red"
-
-                folium.GeoJson(
-                    row.geometry,
-                    style_function=lambda x, col=color: {
-                        "color": col,
-                        "weight": 2
-                    }
-                ).add_to(m)
-
-            except:
-                continue
-
-    # =========================
-    # MARKERS
-    # =========================
+    # markers
     if st.session_state.origin_coords:
         folium.CircleMarker(st.session_state.origin_coords, radius=8, color="green", fill=True).add_to(m)
 
@@ -147,23 +113,31 @@ with col1:
         folium.CircleMarker(st.session_state.destination_coords, radius=8, color="red", fill=True).add_to(m)
 
     # =========================
-    # ROUTE
+    # ROUTE (FAST COMPUTATION)
     # =========================
     if st.session_state.origin and st.session_state.destination:
+
+        def dynamic_weight(u, v, d):
+            penalty = d["penalty"] * (1 + 0.1 * time_step)
+            risk = np.clip(penalty + lam * d["uncertainty"], 0, 1)
+            return d["base_time"] * (1 + alpha * risk)
+
         try:
-            route = nx.shortest_path(G,
-                                    st.session_state.origin,
-                                    st.session_state.destination,
-                                    weight="planned_cost")
+            route = nx.shortest_path(
+                G,
+                st.session_state.origin,
+                st.session_state.destination,
+                weight=dynamic_weight
+            )
 
             coords_route = []
             total_time = 0
 
             for i in range(len(route)-1):
                 u, v = route[i], route[i+1]
-                edge_data = list(G.get_edge_data(u, v).values())[0]
+                edge = list(G.get_edge_data(u, v).values())[0]
 
-                total_time += edge_data["travel_time"]
+                total_time += edge["base_time"]
 
                 idx = np.where(osmids == u)[0][0]
                 lon, lat = coords[idx]
@@ -176,17 +150,10 @@ with col1:
         except:
             st.warning("No route found")
 
-    # =========================
-    # DISPLAY MAP (FAST)
-    # =========================
-    map_data = st_folium(
-        m,
-        height=600,
-        use_container_width=True
-    )
+    map_data = st_folium(m, height=600, use_container_width=True)
 
 # =========================
-# CLICK HANDLER (FIXED)
+# CLICK HANDLER
 # =========================
 if map_data and map_data.get("last_clicked"):
     lat = map_data["last_clicked"]["lat"]
