@@ -5,91 +5,13 @@ import folium
 from streamlit_folium import st_folium
 from scipy.spatial import cKDTree
 import numpy as np
-import time
 
 # =========================
-# PAGE CONFIG
+# CONFIG
 # =========================
 st.set_page_config(page_title="Flood Route Planner", layout="wide")
 
 st.title("🌊 Flood-Route Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm")
-
-# =========================
-# LOADING PROGRESS BAR
-# =========================
-progress = st.progress(0)
-status = st.empty()
-
-# =========================
-# STEP 1: LOAD DATA
-# =========================
-status.text("Loading geospatial data...")
-@st.cache_data
-def load_data():
-    nodes = gpd.read_file("./processed_nodes.gpkg")
-    edges = gpd.read_file("./prediction_test_sequence_0.gpkg")
-    return nodes.to_crs("EPSG:4326"), edges
-
-nodes, edges = load_data()
-progress.progress(30)
-
-# =========================
-# STEP 2: BUILD KD TREE
-# =========================
-status.text("Building spatial index...")
-@st.cache_resource
-def build_tree(nodes):
-    coords = np.array(list(zip(nodes.geometry.x, nodes.geometry.y)))
-    return cKDTree(coords), nodes["osmid"].values, coords
-
-tree, osmids, coords = build_tree(nodes)
-progress.progress(60)
-
-# =========================
-# STEP 3: BUILD GRAPH
-# =========================
-status.text("Initializing routing engine...")
-@st.cache_resource
-def build_graph(edges):
-    G = nx.MultiDiGraph()
-
-    for row in edges.itertuples():
-        try:
-            u, v = row.u, row.v
-            speed = getattr(row, "speed_mps", 25 * 1000 / 3600)
-            length = getattr(row, "length", 0)
-            base_time = getattr(row, "travel_time", length / speed)
-
-            penalty = getattr(row, "pred_flood_penalty", 0)
-            uncertainty = getattr(row, "uncertainty", 0)
-
-            G.add_edge(u, v,
-                       base_time=base_time,
-                       penalty=penalty,
-                       uncertainty=uncertainty)
-
-            G.add_edge(v, u,
-                       base_time=base_time,
-                       penalty=penalty,
-                       uncertainty=uncertainty)
-
-        except:
-            continue
-
-    return G
-
-G = build_graph(edges)
-progress.progress(90)
-
-# =========================
-# FINISH LOADING
-# =========================
-status.text("Finalizing interface...")
-time.sleep(0.3)  # smooth UX feel
-progress.progress(100)
-
-progress.empty()
-status.empty()
 
 # =========================
 # SIDEBAR
@@ -97,6 +19,54 @@ status.empty()
 alpha = st.sidebar.slider("Risk Sensitivity (α)", 0.0, 5.0, 2.0)
 lam = st.sidebar.slider("Uncertainty (λ)", 0.0, 3.0, 1.0)
 time_step = st.sidebar.slider("Flood Time", 0, 10, 0)
+
+# =========================
+# LOAD DATA (CACHED)
+# =========================
+@st.cache_data
+def load_data():
+    nodes = gpd.read_file("./processed_nodes.gpkg")[["osmid", "geometry"]]
+    edges = gpd.read_file("./prediction_test_sequence_0.gpkg")[["u", "v", "length", "speed_mps", "pred_flood_penalty", "uncertainty"]]
+    return nodes.to_crs("EPSG:4326"), edges
+
+nodes, edges = load_data()
+
+# =========================
+# KD TREE (FAST)
+# =========================
+@st.cache_resource
+def build_tree(nodes):
+    coords = np.array(list(zip(nodes.geometry.x, nodes.geometry.y)))
+    return cKDTree(coords), nodes["osmid"].values, coords
+
+tree, osmids, coords = build_tree(nodes)
+
+# =========================
+# GRAPH (LIGHTWEIGHT)
+# =========================
+@st.cache_resource
+def build_graph(edges):
+    G = nx.Graph()
+
+    for row in edges.itertuples():
+        try:
+            u, v = row.u, row.v
+
+            speed = getattr(row, "speed_mps", 25 * 1000 / 3600)
+            length = getattr(row, "length", 0)
+
+            base_time = length / speed if speed > 0 else 0
+
+            G.add_edge(u, v,
+                       base_time=base_time,
+                       penalty=row.pred_flood_penalty,
+                       uncertainty=row.uncertainty)
+        except:
+            continue
+
+    return G
+
+G = build_graph(edges)
 
 # =========================
 # SESSION
@@ -117,11 +87,13 @@ with col2:
     st.radio("Marker", ["origin", "destination"], key="active")
 
     if st.button("Reset"):
-        for k in list(st.session_state.keys()):
-            st.session_state[k] = None
+        st.session_state.origin = None
+        st.session_state.destination = None
+        st.session_state.origin_coords = None
+        st.session_state.destination_coords = None
 
 # =========================
-# MAP
+# MAP (FAST)
 # =========================
 with col1:
     center = [nodes.geometry.y.mean(), nodes.geometry.x.mean()]
@@ -134,7 +106,9 @@ with col1:
     if st.session_state.destination_coords:
         folium.CircleMarker(st.session_state.destination_coords, radius=8, color="red", fill=True).add_to(m)
 
-    # routing
+    # =========================
+    # ROUTING (DYNAMIC COST ONLY)
+    # =========================
     if st.session_state.origin and st.session_state.destination:
 
         def dynamic_weight(u, v, d):
@@ -155,7 +129,7 @@ with col1:
 
             for i in range(len(route)-1):
                 u, v = route[i], route[i+1]
-                edge = list(G.get_edge_data(u, v).values())[0]
+                edge = G[u][v]
 
                 total_time += edge["base_time"]
 
@@ -173,7 +147,7 @@ with col1:
     map_data = st_folium(m, height=600, use_container_width=True)
 
 # =========================
-# CLICK HANDLER
+# CLICK HANDLER (FAST)
 # =========================
 if map_data and map_data.get("last_clicked"):
     lat = map_data["last_clicked"]["lat"]
