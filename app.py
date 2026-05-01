@@ -6,151 +6,236 @@ from streamlit_folium import st_folium
 from scipy.spatial import cKDTree
 import numpy as np
 
-# --- PAGE CONFIG ---
+# =========================
+# PAGE CONFIG
+# =========================
 st.set_page_config(
     page_title="Bayesian Flood Routing",
     layout="wide",
     page_icon="🌊"
 )
 
-# --- HEADER ---
+# =========================
+# CUSTOM CSS (KEY UPGRADE)
+# =========================
 st.markdown("""
-# 🌊 Bayesian Flood Routing System
-### Intelligent Route Planning with Flood Risk Awareness
-""")
+<style>
+/* Main background */
+.main {
+    background-color: #0e1117;
+}
 
-# --- SIDEBAR CONTROLS ---
-st.sidebar.header("⚙️ Model Controls")
+/* Titles */
+h1, h2, h3 {
+    font-family: 'Segoe UI', sans-serif;
+    font-weight: 600;
+}
+
+/* Card container */
+.card {
+    background-color: #161b22;
+    padding: 20px;
+    border-radius: 12px;
+    box-shadow: 0px 4px 20px rgba(0,0,0,0.4);
+    margin-bottom: 15px;
+}
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background-color: #111827;
+}
+
+/* Metric styling */
+[data-testid="metric-container"] {
+    background-color: #161b22;
+    border-radius: 10px;
+    padding: 10px;
+}
+
+/* Buttons */
+.stButton button {
+    background-color: #2563eb;
+    color: white;
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-weight: 500;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
+# HERO HEADER
+# =========================
+st.markdown("""
+<div style='padding:20px 0px'>
+<h1>🌊 Bayesian Flood Routing System</h1>
+<p style='color:gray;font-size:16px'>
+Real-time intelligent routing with flood risk and uncertainty modeling
+</p>
+</div>
+""", unsafe_allow_html=True)
+
+# =========================
+# SIDEBAR (CONTROL PANEL)
+# =========================
+st.sidebar.markdown("## ⚙️ Control Panel")
 
 ROUTING_ALPHA = st.sidebar.slider("Risk Sensitivity (α)", 0.0, 5.0, 2.0)
 BAYES_LAMBDA = st.sidebar.slider("Uncertainty Weight (λ)", 0.0, 3.0, 1.0)
-ASSUME_BIDIRECTIONAL_ROADS = st.sidebar.checkbox("Bidirectional Roads", True)
+ASSUME_BIDIRECTIONAL_ROADS = st.sidebar.toggle("Bidirectional Roads", True)
 
 st.sidebar.markdown("---")
-st.sidebar.info("""
-Adjust parameters to see how flood risk affects routing decisions.
-""")
+st.sidebar.caption("Adjust model behavior dynamically")
 
-# --- FILE PATHS ---
+# =========================
+# FILE PATHS
+# =========================
 NODES_PATH = "./processed_nodes.gpkg"
 EDGES_PATH = "./prediction_test_sequence_0.gpkg"
 
-# --- LOAD DATA ---
+# =========================
+# DATA LOADING
+# =========================
 @st.cache_data
 def load_data():
     nodes = gpd.read_file(NODES_PATH)
     edges = gpd.read_file(EDGES_PATH)
     return nodes, edges, nodes.to_crs("EPSG:4326"), edges.to_crs("EPSG:4326")
 
-
 @st.cache_resource(hash_funcs={gpd.GeoDataFrame: lambda _: None})
 def build_graph(edges_gdf, alpha, lam, bidirectional):
     G = nx.MultiDiGraph()
-
     for _, row in edges_gdf.iterrows():
         try:
             u, v = row["u"], row["v"]
-            key = row.get("key", 0)
-
             speed = float(row.get("speed_mps", 25 * 1000 / 3600))
-            base_time = float(row.get("travel_time", row["length"] / speed))
+            base = float(row.get("travel_time", row["length"] / speed))
 
             penalty = float(row.get("pred_flood_penalty", 0))
             uncertainty = float(row.get("uncertainty", 0))
 
-            planned_penalty = np.clip(penalty + lam * uncertainty, 0, 1)
-            cost = base_time * (1 + alpha * planned_penalty)
+            risk = np.clip(penalty + lam * uncertainty, 0, 1)
+            cost = base * (1 + alpha * risk)
 
-            attrs = {"planned_cost": cost, "length": row["length"]}
-
-            G.add_edge(u, v, key=key, **attrs)
+            G.add_edge(u, v, planned_cost=cost)
 
             if bidirectional:
-                G.add_edge(v, u, key=f"{key}_rev", **attrs)
+                G.add_edge(v, u, planned_cost=cost)
 
         except:
             continue
-
     return G
-
 
 @st.cache_resource(hash_funcs={gpd.GeoDataFrame: lambda _: None})
 def build_kdtree(nodes):
     coords = np.array(list(zip(nodes.geometry.x, nodes.geometry.y)))
     return cKDTree(coords), nodes["osmid"].values, coords
 
-
-# --- SESSION STATE ---
-for key in ["origin", "destination", "origin_coords", "destination_coords", "reset"]:
-    if key not in st.session_state:
-        st.session_state[key] = None
-
-
-def reset():
-    for key in st.session_state.keys():
-        st.session_state[key] = None
-
-
-# --- LOAD ---
-with st.spinner("Loading GIS data..."):
+# =========================
+# LOAD + BUILD
+# =========================
+with st.spinner("Loading data..."):
     nodes, edges, nodes_wgs, edges_wgs = load_data()
 
-# --- BUILD ---
-with st.spinner("Building routing graph..."):
+with st.spinner("Building routing engine..."):
     G = build_graph(edges, ROUTING_ALPHA, BAYES_LAMBDA, ASSUME_BIDIRECTIONAL_ROADS)
     tree, osmids, coords = build_kdtree(nodes_wgs)
 
-# --- METRICS ---
+# =========================
+# DASHBOARD METRICS
+# =========================
+st.markdown("### 📊 System Overview")
+
 col1, col2, col3 = st.columns(3)
 
-col1.metric("Nodes", len(nodes))
-col2.metric("Edges", len(edges))
-col3.metric("Graph Density", f"{nx.density(G):.4f}")
+col1.metric("Nodes", f"{len(nodes):,}")
+col2.metric("Edges", f"{len(edges):,}")
+col3.metric("Density", f"{nx.density(G):.4f}")
 
 st.markdown("---")
 
-# --- MAP ---
-center = [nodes_wgs.geometry.y.mean(), nodes_wgs.geometry.x.mean()]
+# =========================
+# SESSION STATE
+# =========================
+for k in ["origin", "destination", "origin_coords", "destination_coords", "reset"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
 
-m = folium.Map(location=center, zoom_start=13, tiles="CartoDB positron")
+def reset():
+    for k in st.session_state:
+        st.session_state[k] = None
 
-# --- MARKERS ---
-if st.session_state.origin_coords:
-    folium.Marker(st.session_state.origin_coords, icon=folium.Icon(color="green")).add_to(m)
+# =========================
+# MAIN LAYOUT (2-COLUMN)
+# =========================
+left, right = st.columns([2.5, 1])
 
-if st.session_state.destination_coords:
-    folium.Marker(st.session_state.destination_coords, icon=folium.Icon(color="red")).add_to(m)
+# =========================
+# MAP PANEL
+# =========================
+with left:
+    st.markdown("### 🗺️ Interactive Map")
 
-# --- ROUTE ---
-route_found = False
-route_length = 0
-route_cost = 0
+    center = [nodes_wgs.geometry.y.mean(), nodes_wgs.geometry.x.mean()]
+    m = folium.Map(location=center, zoom_start=13, tiles="CartoDB positron")
 
-if st.session_state.origin and st.session_state.destination:
-    try:
-        route = nx.shortest_path(G,
-                                st.session_state.origin,
-                                st.session_state.destination,
-                                weight="planned_cost")
+    if st.session_state.origin_coords:
+        folium.Marker(st.session_state.origin_coords, icon=folium.Icon(color="green")).add_to(m)
 
-        route_coords = []
-        for n in route:
-            idx = np.where(osmids == n)[0][0]
-            lon, lat = coords[idx]
-            route_coords.append((lat, lon))
+    if st.session_state.destination_coords:
+        folium.Marker(st.session_state.destination_coords, icon=folium.Icon(color="red")).add_to(m)
 
-        folium.PolyLine(route_coords, color="blue", weight=5).add_to(m)
+    route_found = False
+    route_nodes = 0
 
-        route_found = True
-        route_length = len(route)
+    if st.session_state.origin and st.session_state.destination:
+        try:
+            route = nx.shortest_path(G,
+                                    st.session_state.origin,
+                                    st.session_state.destination,
+                                    weight="planned_cost")
 
-    except:
-        st.error("No route found.")
+            coords_route = []
+            for n in route:
+                idx = np.where(osmids == n)[0][0]
+                lon, lat = coords[idx]
+                coords_route.append((lat, lon))
 
-# --- MAP DISPLAY ---
-map_data = st_folium(m, width=1000, height=600)
+            folium.PolyLine(coords_route, color="#3b82f6", weight=6).add_to(m)
 
-# --- CLICK HANDLER ---
+            route_found = True
+            route_nodes = len(route)
+
+        except:
+            st.error("No route found.")
+
+    map_data = st_folium(m, width=900, height=600)
+
+# =========================
+# SIDE PANEL (RESULTS)
+# =========================
+with right:
+    st.markdown("### 📍 Route Info")
+
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+
+    if route_found:
+        st.success("Route computed")
+
+        st.metric("Nodes in Route", route_nodes)
+        st.metric("Risk Factor", f"{ROUTING_ALPHA:.2f}")
+
+    else:
+        st.info("Click on the map to select origin and destination.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("### 🎮 Actions")
+    st.button("🔄 Reset Route", on_click=reset)
+
+# =========================
+# CLICK HANDLER
+# =========================
 if map_data.get("last_clicked") and not st.session_state.reset:
     lat, lon = map_data["last_clicked"]["lat"], map_data["last_clicked"]["lng"]
 
@@ -174,19 +259,14 @@ if map_data.get("last_clicked") and not st.session_state.reset:
         st.session_state.origin_coords = coord
         st.rerun()
 
-# --- ROUTE PANEL ---
-if route_found:
-    st.success("✅ Optimal route computed")
+st.session_state.reset = False
 
-    c1, c2 = st.columns(2)
-    c1.metric("Route Nodes", route_length)
-    c2.metric("Risk-Aware Cost", f"{route_length * ROUTING_ALPHA:.2f}")
-
-# --- BUTTONS ---
-st.button("🔄 Reset", on_click=reset)
-
-# --- FOOTER ---
+# =========================
+# FOOTER
+# =========================
 st.markdown("""
 ---
-💡 **Tip:** Increase α to avoid flooded roads more aggressively.
-""")
+<p style='text-align:center;color:gray'>
+Bayesian Flood Routing System • Research Prototype
+</p>
+""", unsafe_allow_html=True)
