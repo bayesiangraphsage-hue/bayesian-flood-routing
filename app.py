@@ -15,7 +15,7 @@ st.set_page_config(page_title="Flood Route Planner", layout="wide")
 # =========================
 # TITLE
 # =========================
-st.title("🌊 Flood-Route Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm")
+st.title("Flood-Route Planner using Bayesian GraphSAGE-GRU and Dijkstra's Algorithm")
 st.caption("Flood-aware routing with uncertainty modeling and optimal path computation")
 
 # =========================
