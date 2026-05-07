@@ -1,8 +1,16 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
+
+# Friendly import check for PyTorch to provide an actionable Streamlit error
+try:
+    import torch
+    import torch.nn as nn
+except ModuleNotFoundError:
+    st.error(
+        "Missing dependency: `torch`.\n\nInstall it locally with `pip install torch` or add it to `requirements.txt`."
+    )
+    st.stop()
 import plotly.graph_objects as go
 from pathlib import Path
 from io import BytesIO
